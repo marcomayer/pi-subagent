@@ -2,21 +2,24 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in its own [herdr](https://github.com/ogulcancelik/herdr) pane with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or focus the child's pane.
+
+The first subagent opens to the right of the parent's pane; later ones stack below it, and the column is kept at equal heights. Children inherit the spawning process's environment, including variables loaded by direnv.
 
 ## Requirements
 
-- Pi
+- Pi, running inside a herdr pane
+- herdr 0.8.2 or newer
 - Node.js 22.19 or newer
-- tmux
 
 ## Install
 
-Clone into Pi's global extension directory and expose the CLI on `PATH`:
+Clone into Pi's global extension directory, expose the CLI on `PATH`, and link the bundled herdr plugin, which starts each child without typing into a shell:
 
 ```sh
 git clone git@github.com:earendil-works/pi-subagent.git ~/.pi/agent/extensions/subagent
 ln -s ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent
+herdr plugin link ~/.pi/agent/extensions/subagent/herdr-plugin
 ```
 
 Run `/reload` in an existing Pi session. The extension contributes its bundled skill automatically.
@@ -68,7 +71,7 @@ subagent stop a1b2c3
 subagent list
 ```
 
-Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent` to select an active child and focus its pane. The status widget shows active names (or handles for unnamed runs) and their current state.
 
 ## Isolation
 

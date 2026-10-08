@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import {
 	accessSync,
 	constants,
@@ -12,17 +11,19 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { equalizeSubagentPanes, focusSubagentPane, openSubagentPane, renameSubagentPane } from "./herdr.ts";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
 export interface RunMetadata {
-	version: 1;
+	version: 2;
 	handle: string;
 	name?: string;
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
-	tmuxSession: string;
+	/** Herdr pane hosting the child, as of its last launch; herdr assigns a new id if the user moves the pane. */
+	paneId?: string;
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -80,6 +81,14 @@ export function inboxDir(runDir: string): string {
 	return join(runDir, "inbox");
 }
 
+function launchScriptPath(runDir: string): string {
+	return join(runDir, "launch.sh");
+}
+
+function pidPath(runDir: string): string {
+	return join(runDir, "pid");
+}
+
 export function isValidRunName(value: unknown): value is string {
 	return (
 		typeof value === "string" &&
@@ -100,10 +109,9 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 		if (typeof value !== "object" || value === null) return undefined;
 		const metadata = value as Partial<RunMetadata>;
 		if (
-			metadata.version !== 1 ||
+			metadata.version !== 2 ||
 			typeof metadata.handle !== "string" ||
 			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
-			typeof metadata.tmuxSession !== "string" ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
 		) {
@@ -129,7 +137,7 @@ export function updateMetadata(runDir: string, patch: Partial<RunMetadata>): Run
 	const next: RunMetadata = {
 		...current,
 		...patch,
-		version: 1,
+		version: 2,
 		handle: current.handle,
 		runDir: current.runDir,
 		updatedAt: new Date().toISOString(),
@@ -151,12 +159,82 @@ export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-export function tmuxSessionExists(session: string): boolean {
-	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
+function readRunPid(runDir: string): number | undefined {
+	try {
+		const pid = Number(readFileSync(pidPath(runDir), "utf8").trim());
+		return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+/** True while the child's process, whose pid launch.sh records before exec'ing pi, is running. */
+export function isRunAlive(metadata: RunMetadata): boolean {
+	const pid = readRunPid(metadata.runDir);
+	if (pid === undefined) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/** Hang up the child's process group like a closing terminal would; herdr closes the pane once it exits. */
+export function stopRunProcess(metadata: RunMetadata): void {
+	const pid = readRunPid(metadata.runDir);
+	if (pid === undefined) return;
+	try {
+		process.kill(-pid, "SIGHUP");
+	} catch {
+		try {
+			process.kill(pid, "SIGHUP");
+		} catch {
+			// Already exited.
+		}
+	}
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/** The caller's environment, minus herdr's per-pane variables which herdr sets for the new pane itself. */
+function childEnvironment(runDir: string): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value === undefined || key.startsWith("HERDR_")) continue;
+		env[key] = value;
+	}
+	env.PI_SUBAGENT_RUN_DIR = runDir;
+	return env;
+}
+
+/** Pane ids of the other live runs spawned by the same parent session. */
+function siblingPaneIds(metadata: RunMetadata): string[] {
+	return listRuns()
+		.filter((run) => run.handle !== metadata.handle && run.parentSessionId === metadata.parentSessionId)
+		.filter((run) => run.paneId !== undefined && isRunAlive(run))
+		.map((run) => run.paneId!);
+}
+
+async function waitForRunPid(runDir: string, timeoutMs = 5000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (readRunPid(runDir) !== undefined) return;
+		await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 50));
+	}
+	throw new Error(`Subagent process did not start within ${timeoutMs}ms`);
+}
+
+/**
+ * Start the child pi process for a run in a herdr pane beside the caller's pane (`HERDR_PANE_ID`), with the
+ * caller's environment. `initialArgs` are only passed on first spawn. Returns the new pane id.
+ */
+export async function launchRun(metadata: RunMetadata, initialArgs: string[] = []): Promise<string> {
+	const parentPaneId = process.env.HERDR_PANE_ID;
+	if (!parentPaneId) throw new Error("Subagents require running inside herdr: HERDR_PANE_ID is unset");
+
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
 	try {
@@ -166,43 +244,66 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		// Use the installed pi executable.
 	}
 
-	const result = spawnSync(
-		"tmux",
-		[
-			"new-session",
-			"-d",
-			"-s",
-			metadata.tmuxSession,
-			"-x",
-			"120",
-			"-y",
-			"40",
-			"-c",
-			metadata.cwd,
-			"--",
-			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			launcher,
-			"--session",
-			metadata.sessionFile,
-			"--provider",
-			metadata.provider,
-			"--model",
-			metadata.model,
-			"--thinking",
-			metadata.thinking,
-			...(metadata.launchArgs ?? []),
-			...initialArgs,
-		],
-		{ encoding: "utf8" },
-	);
-	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
+	const argv = [
+		launcher,
+		"--session",
+		metadata.sessionFile,
+		"--provider",
+		metadata.provider,
+		"--model",
+		metadata.model,
+		"--thinking",
+		metadata.thinking,
+		...(metadata.launchArgs ?? []),
+		...initialArgs,
+	];
+	// exec keeps the recorded pid for the launcher, which leads the pane's process group.
+	// Ctrl+Z is ignored because the pane has no shell to resume a stopped pi from.
+	const script = [
+		"trap '' TSTP",
+		`echo $$ > ${shellQuote(pidPath(metadata.runDir))}`,
+		`exec ${argv.map(shellQuote).join(" ")}`,
+		"",
+	].join("\n");
+	writeFileSync(launchScriptPath(metadata.runDir), script, { encoding: "utf8", mode: 0o600 });
+	rmSync(pidPath(metadata.runDir), { force: true });
+
+	const paneId = await openSubagentPane({
+		parentPaneId,
+		siblingPaneIds: siblingPaneIds(metadata),
+		cwd: metadata.cwd,
+		env: childEnvironment(metadata.runDir),
+	});
+	updateMetadata(metadata.runDir, { paneId });
+	await waitForRunPid(metadata.runDir);
+	return paneId;
+}
+
+/** Give the live runs' panes beside the caller's pane equal heights, e.g. after one exited. */
+export async function equalizeRunPanes(runs: RunMetadata[]): Promise<void> {
+	const parentPaneId = process.env.HERDR_PANE_ID;
+	if (!parentPaneId) return;
+	const paneIds = runs.filter((run) => run.paneId !== undefined && isRunAlive(run)).map((run) => run.paneId!);
+	await equalizeSubagentPanes(parentPaneId, paneIds);
+}
+
+/** Focus the herdr pane of a run. */
+export async function focusRunPane(metadata: RunMetadata): Promise<void> {
+	if (!metadata.paneId) throw new Error(`${metadata.handle} has no pane`);
+	await focusSubagentPane(metadata.paneId);
+}
+
+/** Label the herdr pane the current process runs in; no-op outside herdr. */
+export async function labelOwnPane(label: string): Promise<void> {
+	const paneId = process.env.HERDR_PANE_ID;
+	if (!paneId) return;
+	await renameSubagentPane(paneId, label);
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {
 	if (
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
+		!isRunAlive(metadata)
 	) {
 		return "exited";
 	}

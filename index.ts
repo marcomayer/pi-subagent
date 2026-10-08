@@ -1,20 +1,23 @@
-import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
-import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
+import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import {
 	effectiveRunState,
+	equalizeRunPanes,
+	focusRunPane,
 	inboxDir,
+	isRunAlive,
+	labelOwnPane,
 	launchRun,
 	listRuns,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
+	stopRunProcess,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
@@ -38,7 +41,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("subagent", {
-		description: "Select and attach to a subagent spawned by this session",
+		description: "Select and focus the herdr pane of a subagent spawned by this session",
 		handler: async (_args, ctx) => {
 			const runs = listRuns(ctx.sessionManager.getSessionId()).filter((run) => effectiveRunState(run) !== "exited");
 			if (runs.length === 0) {
@@ -50,9 +53,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				value: run.handle,
 				label: `${runDisplayName(run)}  ${displayState(run)}  ${run.provider}/${run.model}  ${run.thinking}`,
 			}));
-			let tui: TUI | undefined;
 			const selected = await ctx.ui.custom<string | undefined>((customTui, theme, _keybindings, done) => {
-				tui = customTui;
 				const list = new SelectList(items, Math.min(items.length, 10), {
 					selectedPrefix: (text) => theme.fg("accent", text),
 					selectedText: (text) => theme.fg("accent", text),
@@ -65,13 +66,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 				const container = new Container();
 				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-				container.addChild(new Text(theme.fg("accent", theme.bold("Attach to subagent")), 1, 0));
+				container.addChild(new Text(theme.fg("accent", theme.bold("Focus subagent")), 1, 0));
 				container.addChild(list);
 				container.addChild(
 					new Text(
 						theme.fg(
 							"dim",
-							`${keyHint("tui.select.confirm", "attach")}  ${keyHint("tui.select.cancel", "cancel")}`,
+							`${keyHint("tui.select.confirm", "focus")}  ${keyHint("tui.select.cancel", "cancel")}`,
 						),
 						1,
 						0,
@@ -88,31 +89,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					},
 				};
 			});
-			if (!selected || !tui) return;
+			if (!selected) return;
 			const run = runs.find((candidate) => candidate.handle === selected);
 			if (!run) return;
 
-			if (process.env.TMUX) {
-				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["switch-client", "-t", run.tmuxSession], { stdio: "inherit" });
-					child.on("error", () => resolveExit(null));
-					child.on("close", resolveExit);
-				});
-				if (exitCode !== 0) ctx.ui.notify(`Could not switch to ${run.handle}`, "error");
-				return;
-			}
-
-			tui.stop();
 			try {
-				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["attach-session", "-t", run.tmuxSession], { stdio: "inherit" });
-					child.on("error", () => resolveExit(null));
-					child.on("close", resolveExit);
-				});
-				if (exitCode !== 0) process.stderr.write(`Could not attach to ${run.handle}\n`);
-			} finally {
-				tui.start();
-				tui.requestRender(true);
+				await focusRunPane(run);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Could not focus ${run.handle}: ${message}`, "error");
 			}
 		},
 	});
@@ -120,6 +105,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	if (!runDir) {
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
 		let widgetContext: ExtensionContext | undefined;
+		let arrangedPaneIds: string | undefined;
+
+		// Re-equalize the subagent column whenever its set of panes changes, e.g. after a child exited.
+		const arrangePanes = (): void => {
+			if (!widgetContext) return;
+			const runs = listRuns(widgetContext.sessionManager.getSessionId());
+			const paneIds = runs
+				.filter(isRunAlive)
+				.map((run) => run.paneId)
+				.join(",");
+			if (paneIds === arrangedPaneIds) return;
+			arrangedPaneIds = paneIds;
+			equalizeRunPanes(runs).catch(() => {});
+		};
 
 		const refreshWidget = (): void => {
 			if (!widgetContext) return;
@@ -146,17 +145,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 		};
 
-		pi.on("session_start", (_event, ctx) => {
+		pi.on("session_start", async (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!run.suspended || tmuxSessionExists(run.tmuxSession)) continue;
+				if (!run.suspended || isRunAlive(run)) continue;
 				if (!existsSync(run.sessionFile)) {
 					removeRunDir(run.runDir);
 					continue;
 				}
 				const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
 				try {
-					launchRun(starting);
+					await launchRun(starting);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					updateMetadata(run.runDir, { state: "error", error: message });
@@ -166,8 +165,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 			if (!ctx.hasUI) return;
 			widgetContext = ctx;
+			arrangedPaneIds = undefined;
 			refreshWidget();
-			widgetTimer = setInterval(refreshWidget, 1000);
+			arrangePanes();
+			widgetTimer = setInterval(() => {
+				refreshWidget();
+				arrangePanes();
+			}, 1000);
 			widgetTimer.unref();
 		});
 
@@ -180,12 +184,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!tmuxSessionExists(run.tmuxSession)) {
+				if (!isRunAlive(run)) {
 					if (!run.suspended) removeRunDir(run.runDir);
 					continue;
 				}
 				updateMetadata(run.runDir, { suspended: true });
-				spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+				stopRunProcess(run);
 				await waitForRunShutdown(run.runDir);
 			}
 		});
@@ -203,6 +207,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const next = `subagent ${metadata.name ?? metadata.handle}`;
 		if (next === sessionName) return;
 		pi.setSessionName(next);
+		labelOwnPane(metadata.name ?? metadata.handle).catch(() => {});
 		sessionName = next;
 	};
 

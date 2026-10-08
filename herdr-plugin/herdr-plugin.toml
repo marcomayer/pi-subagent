@@ -1,0 +1,14 @@
+id = "pi-subagent"
+name = "Pi Subagent"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Run pi subagents in herdr panes"
+platforms = ["linux", "macos"]
+
+# Herdr runs this argv directly, so pi starts without typing into an interactive shell.
+# The run directory comes from the pane's --env; launch.sh is written by the subagent extension.
+[[panes]]
+id = "subagent"
+title = "Pi subagent"
+placement = "split"
+command = ["sh", "-c", "exec sh \"$PI_SUBAGENT_RUN_DIR/launch.sh\""]
