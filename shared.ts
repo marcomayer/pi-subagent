@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	accessSync,
 	constants,
@@ -12,6 +13,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { equalizeSubagentPanes, focusSubagentPane, openSubagentPane, renameSubagentPane } from "./herdr.ts";
+import { withPaneLayoutLock } from "./pane-lock.ts";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
@@ -210,6 +212,14 @@ function childEnvironment(runDir: string): Record<string, string> {
 	return env;
 }
 
+/** All callers that mutate this parent's subagent layout must share a lock, including separate CLIs. */
+function withRunPaneLock<T>(parentPaneId: string, operation: () => Promise<T>): Promise<T> {
+	const key = createHash("sha256")
+		.update(`${process.env.HERDR_SOCKET_PATH ?? ""}\0${parentPaneId}`)
+		.digest("hex");
+	return withPaneLayoutLock(join(getAgentDir(), "subagent-pane-locks", key), operation);
+}
+
 /** Pane ids of the other live runs spawned by the same parent session. */
 function siblingPaneIds(metadata: RunMetadata): string[] {
 	return listRuns()
@@ -268,23 +278,34 @@ export async function launchRun(metadata: RunMetadata, initialArgs: string[] = [
 	writeFileSync(launchScriptPath(metadata.runDir), script, { encoding: "utf8", mode: 0o600 });
 	rmSync(pidPath(metadata.runDir), { force: true });
 
-	const paneId = await openSubagentPane({
-		parentPaneId,
-		siblingPaneIds: siblingPaneIds(metadata),
-		cwd: metadata.cwd,
-		env: childEnvironment(metadata.runDir),
+	return withRunPaneLock(parentPaneId, async () => {
+		// Discover siblings only after acquiring the lock: another CLI may have just opened one.
+		const siblings = siblingPaneIds(metadata);
+		const paneId = await openSubagentPane({
+			parentPaneId,
+			siblingPaneIds: siblings,
+			cwd: metadata.cwd,
+			env: childEnvironment(metadata.runDir),
+		});
+		updateMetadata(metadata.runDir, { paneId });
+		// Sibling discovery requires a live PID, so do not let the next spawn proceed before it exists.
+		await waitForRunPid(metadata.runDir);
+		await equalizeSubagentPanes(parentPaneId, [...siblings, paneId]);
+		return paneId;
 	});
-	updateMetadata(metadata.runDir, { paneId });
-	await waitForRunPid(metadata.runDir);
-	return paneId;
 }
 
 /** Give the live runs' panes beside the caller's pane equal heights, e.g. after one exited. */
-export async function equalizeRunPanes(runs: RunMetadata[]): Promise<void> {
+export async function equalizeRunPanes(parentSessionId?: string): Promise<void> {
 	const parentPaneId = process.env.HERDR_PANE_ID;
 	if (!parentPaneId) return;
-	const paneIds = runs.filter((run) => run.paneId !== undefined && isRunAlive(run)).map((run) => run.paneId!);
-	await equalizeSubagentPanes(parentPaneId, paneIds);
+	await withRunPaneLock(parentPaneId, async () => {
+		// A caller's snapshot can be stale by the time its lock is acquired.
+		const paneIds = listRuns(parentSessionId)
+			.filter((run) => run.paneId !== undefined && isRunAlive(run))
+			.map((run) => run.paneId!);
+		await equalizeSubagentPanes(parentPaneId, paneIds);
+	});
 }
 
 /** Focus the herdr pane of a run. */

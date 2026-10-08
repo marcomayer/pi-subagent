@@ -4,7 +4,7 @@ Observable, persistent Pi subagents for independent reviews, investigations, and
 
 Each subagent runs in its own [herdr](https://github.com/ogulcancelik/herdr) pane with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or focus the child's pane.
 
-The first subagent opens to the right of the parent's pane; later ones stack below it, and the column is kept at equal heights. Children inherit the spawning process's environment, including variables loaded by direnv.
+The first subagent opens to the right of the parent's pane; later ones stack below it, and the column is kept at equal heights. Concurrent spawns coordinate pane creation and resizing across processes; the agents themselves still work concurrently. Children inherit the spawning process's environment, including variables loaded by direnv.
 
 ## Requirements
 
@@ -84,3 +84,7 @@ Optional spawn flags:
 - `--no-context-files`: ignore repository instruction files
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+
+## Development
+
+Run `npm test` with Node.js 22.19 or newer. The tests exercise concurrent CLI spawns against a mock Herdr socket, plus cross-process locking, crash recovery, and bounded waiting. Parent lifecycle tests use a simulated Pi host and clock to verify capped layout retry backoff. They do not open terminal panes or launch Pi agents.

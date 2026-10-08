@@ -23,6 +23,8 @@ import {
 } from "./shared.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
+const INITIAL_LAYOUT_RETRY_MS = 2000;
+const MAX_LAYOUT_RETRY_MS = 30_000;
 
 function isInboxMessage(value: unknown): value is InboxMessage {
 	if (typeof value !== "object" || value === null) return false;
@@ -106,18 +108,41 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
 		let widgetContext: ExtensionContext | undefined;
 		let arrangedPaneIds: string | undefined;
+		let observedPaneIds: string | undefined;
+		let arrangingPanes = false;
+		let layoutRetryDelay = INITIAL_LAYOUT_RETRY_MS;
+		let nextLayoutAttempt = 0;
 
 		// Re-equalize the subagent column whenever its set of panes changes, e.g. after a child exited.
 		const arrangePanes = (): void => {
-			if (!widgetContext) return;
-			const runs = listRuns(widgetContext.sessionManager.getSessionId());
+			if (!widgetContext || arrangingPanes) return;
+			const context = widgetContext;
+			const runs = listRuns(context.sessionManager.getSessionId());
 			const paneIds = runs
 				.filter(isRunAlive)
 				.map((run) => run.paneId)
 				.join(",");
-			if (paneIds === arrangedPaneIds) return;
-			arrangedPaneIds = paneIds;
-			equalizeRunPanes(runs).catch(() => {});
+			if (paneIds !== observedPaneIds) {
+				observedPaneIds = paneIds;
+				layoutRetryDelay = INITIAL_LAYOUT_RETRY_MS;
+				nextLayoutAttempt = 0;
+			}
+			if (paneIds === arrangedPaneIds || performance.now() < nextLayoutAttempt) return;
+			arrangingPanes = true;
+			equalizeRunPanes(context.sessionManager.getSessionId())
+				.then(() => {
+					if (widgetContext !== context) return;
+					arrangedPaneIds = paneIds;
+					layoutRetryDelay = INITIAL_LAYOUT_RETRY_MS;
+					nextLayoutAttempt = 0;
+				})
+				.catch(() => {
+					if (widgetContext !== context) return;
+					// Retry transient failures without hammering Herdr on every widget tick.
+					nextLayoutAttempt = performance.now() + layoutRetryDelay;
+					layoutRetryDelay = Math.min(layoutRetryDelay * 2, MAX_LAYOUT_RETRY_MS);
+				})
+				.finally(() => { arrangingPanes = false; });
 		};
 
 		const refreshWidget = (): void => {
@@ -166,6 +191,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!ctx.hasUI) return;
 			widgetContext = ctx;
 			arrangedPaneIds = undefined;
+			observedPaneIds = undefined;
+			layoutRetryDelay = INITIAL_LAYOUT_RETRY_MS;
+			nextLayoutAttempt = 0;
 			refreshWidget();
 			arrangePanes();
 			widgetTimer = setInterval(() => {

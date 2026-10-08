@@ -25,6 +25,8 @@ function herdrRequest<T>(method: string, params: Record<string, unknown>): Promi
 		const socket = createConnection(socketPath);
 		let buffer = "";
 		socket.setEncoding("utf8");
+		// A stalled Herdr request must not hold the cross-process layout lock indefinitely.
+		socket.setTimeout(10_000, () => socket.destroy(new Error(`herdr ${method}: request timed out`)));
 		socket.on("connect", () => socket.write(`${JSON.stringify({ id: "1", method, params })}\n`));
 		socket.on("data", (chunk: string) => {
 			buffer += chunk;
@@ -97,7 +99,8 @@ export async function equalizeSubagentPanes(parentPaneId: string, subagentPaneId
 
 /**
  * Open a subagent pane running the run directory's launch.sh. The first subagent splits right of the
- * parent pane; later ones split below the lowest sibling, then the column is equalized. Returns the pane id.
+ * parent pane; later ones split below the lowest sibling. The caller holds the layout lock and registers
+ * the new pane before equalizing the column. Returns the pane id.
  */
 export async function openSubagentPane(options: {
 	parentPaneId: string;
@@ -118,10 +121,7 @@ export async function openSubagentPane(options: {
 		env: options.env,
 		focus: false,
 	});
-	const paneId = result.plugin_pane.pane.pane_id;
-
-	await equalizeSubagentPanes(options.parentPaneId, [...options.siblingPaneIds, paneId]);
-	return paneId;
+	return result.plugin_pane.pane.pane_id;
 }
 
 /** Focus a subagent's herdr pane, switching tab or workspace if needed. */
