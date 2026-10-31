@@ -61,39 +61,58 @@ function subagentColumn(layout: PaneLayout, subagentPaneIds: string[]): PaneLayo
 	return panes.filter((pane) => pane.rect.x === top.rect.x);
 }
 
+type LayoutNode =
+	| { type: "pane"; pane_id?: string }
+	| { type: "split"; direction: "right" | "down"; ratio: number; first: LayoutNode; second: LayoutNode };
+
+/** Split path as `layout.set_split_ratio` takes it: from the tab root, true steps into `second`. */
+type SplitPath = boolean[];
+
+function containsAny(node: LayoutNode, paneIds: Set<string>): boolean {
+	if (node.type === "pane") return node.pane_id !== undefined && paneIds.has(node.pane_id);
+	return containsAny(node.first, paneIds) || containsAny(node.second, paneIds);
+}
+
+/** The subtree that holds every given pane and nothing more specific, with its path. */
+function smallestCommonNode(root: LayoutNode, paneIds: Set<string>): { node: LayoutNode; path: SplitPath } {
+	let node = root;
+	const path: SplitPath = [];
+	while (node.type === "split") {
+		const inFirst = containsAny(node.first, paneIds);
+		const inSecond = containsAny(node.second, paneIds);
+		if (inFirst === inSecond) break;
+		path.push(inSecond);
+		node = inSecond ? node.second : node.first;
+	}
+	return { node, path };
+}
+
 /**
- * Resize a parent's subagent column so every pane gets the same height. Herdr splits are binary, so
- * the column is a chain of down-splits; the split above pane i+1 must give pane i 1/(n-i) of the rest.
+ * Give a parent's subagent column equal heights. Herdr splits are binary, so the column is a chain of
+ * down-splits, each one's `second` holding the panes below; split i must give its upper pane 1/(n-i).
+ * Ratios are set absolutely, so re-running on an equal column sends no requests.
  */
 export async function equalizeSubagentPanes(parentPaneId: string, subagentPaneIds: string[]): Promise<void> {
-	let layout = await readPaneLayout(parentPaneId);
-	const column = subagentColumn(layout, subagentPaneIds).map((pane) => pane.pane_id);
+	const { layout } = await herdrRequest<{ layout: { tab_id: string; root: LayoutNode } }>("layout.export", {
+		pane_id: parentPaneId,
+	});
+	const column = smallestCommonNode(layout.root, new Set(subagentPaneIds));
+	// A rearranged tab can put the parent inside that subtree; never resize the parent's own pane.
+	if (containsAny(column.node, new Set([parentPaneId]))) return;
 
-	for (let i = 0; i < column.length - 1; i++) {
-		const upper = layout.panes.find((pane) => pane.pane_id === column[i])?.rect;
-		const lower = layout.panes.find((pane) => pane.pane_id === column[i + 1])?.rect;
-		if (!upper || !lower) return;
+	const chain: { path: SplitPath; ratio: number }[] = [];
+	let node = column.node;
+	const path = [...column.path];
+	while (node.type === "split" && node.direction === "down") {
+		chain.push({ path: [...path], ratio: node.ratio });
+		path.push(true);
+		node = node.second;
+	}
 
-		// The innermost down-split spanning both panes is the one whose divider sits between them.
-		const split = layout.splits
-			.filter(
-				({ direction, rect }) =>
-					direction === "down" &&
-					rect.x <= upper.x &&
-					rect.x + rect.width >= upper.x + upper.width &&
-					rect.y <= upper.y &&
-					rect.y + rect.height >= lower.y + lower.height,
-			)
-			.sort((a, b) => a.rect.height - b.rect.height)[0];
-		if (!split) return;
-
-		const delta = 1 / (column.length - i) - split.ratio;
-		if (Math.abs(delta) < 0.01) continue;
-
-		// Resizing a pane moves its nearest divider in the given direction: down grows the upper pane, up shrinks it.
-		if (delta > 0) await herdrRequest("pane.resize", { pane_id: column[i], direction: "down", amount: delta });
-		else await herdrRequest("pane.resize", { pane_id: column[i + 1], direction: "up", amount: -delta });
-		layout = await readPaneLayout(parentPaneId);
+	for (const [i, split] of chain.entries()) {
+		const ratio = 1 / (chain.length + 1 - i);
+		if (Math.abs(split.ratio - ratio) < 0.01) continue;
+		await herdrRequest("layout.set_split_ratio", { tab_id: layout.tab_id, path: split.path, ratio });
 	}
 }
 

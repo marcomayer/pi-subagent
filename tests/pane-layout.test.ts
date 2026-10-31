@@ -36,6 +36,7 @@ async function fixture(pidDelayMs: number | null = 0) {
 	let failLayoutReads = false;
 	let layoutReads = 0;
 	let pendingLaunches = 0;
+	let splitRatioSets = 0;
 	let onOpen: (() => void) | undefined;
 	const opens: { id: string; target: string; direction: string }[] = [];
 	const renames: { pane_id: string; label: string }[] = [];
@@ -75,18 +76,26 @@ async function fixture(pidDelayMs: number | null = 0) {
 		return node;
 	}
 
-	function resize(node: Tree, target: string, direction: string, amount: number): boolean {
-		if ("id" in node) return node.id === target;
-		for (let side = 0; side < 2; side++) {
-			if (!resize(node.children[side], target, direction, amount)) continue;
-			if (node.direction === "down" && side === (direction === "down" ? 0 : 1)) {
-				node.ratio += direction === "down" ? amount : -amount;
-				// Stop at the nearest matching divider, but propagate that the pane was found.
-				throw "resized";
-			}
-			return true;
+	/** Herdr's portable layout tree, as returned by layout.export. */
+	function exportTree(node: Tree): unknown {
+		if ("id" in node) return { type: "pane", pane_id: node.id };
+		return {
+			type: "split",
+			direction: node.direction,
+			ratio: node.ratio,
+			first: exportTree(node.children[0]),
+			second: exportTree(node.children[1]),
+		};
+	}
+
+	/** Herdr split paths step from the tab root: true is the second child, false the first. */
+	function splitAt(path: boolean[]): Split | undefined {
+		let node = tree;
+		for (const second of path) {
+			if ("id" in node) return undefined;
+			node = node.children[second ? 1 : 0];
 		}
-		return false;
+		return "id" in node ? undefined : node;
 	}
 
 	const server = createServer((socket) => {
@@ -134,13 +143,20 @@ async function fixture(pidDelayMs: number | null = 0) {
 			} else if (request.method === "pane.rename") {
 				renames.push(request.params);
 				reply({});
-			} else if (request.method === "pane.resize") {
-				try {
-					resize(tree, request.params.pane_id, request.params.direction, request.params.amount);
-				} catch (error) {
-					if (error !== "resized") throw error;
+			} else if (request.method === "layout.export") {
+				layoutReads++;
+				if (failLayoutReads) {
+					socket.end(`${JSON.stringify({ id: request.id, error: { message: "persistent layout failure" } })}\n`);
+				} else reply({ type: "layout_export", layout: { tab_id: "tab-1", root: exportTree(tree) } });
+			} else if (request.method === "layout.set_split_ratio") {
+				const split = request.params.tab_id === "tab-1" ? splitAt(request.params.path) : undefined;
+				if (!split) {
+					socket.end(`${JSON.stringify({ id: request.id, error: { code: "split_not_found", message: "split path not found" } })}\n`);
+					return;
 				}
-				reply({});
+				split.ratio = request.params.ratio;
+				splitRatioSets++;
+				reply({ type: "layout_split_ratio_set" });
 			} else {
 				throw new Error(`Unexpected Herdr request: ${request.method}`);
 			}
@@ -249,6 +265,16 @@ async function fixture(pidDelayMs: number | null = 0) {
 		failOpen: () => { failNextOpen = true; },
 		failLayouts: (fail = true) => { failLayoutReads = fail; },
 		layoutReadCount: () => layoutReads,
+		splitRatioSetCount: () => splitRatioSets,
+		/** Skew every down-split, as a user dragging dividers would. */
+		skewColumn: () => {
+			const skew = (node: Tree) => {
+				if ("id" in node) return;
+				if (node.direction === "down") node.ratio = 0.8;
+				node.children.forEach(skew);
+			};
+			skew(tree);
+		},
 		parentExtension,
 		onOpen: (callback: () => void) => { onOpen = callback; },
 		async close() {
@@ -316,6 +342,20 @@ test("concurrent spawns extend an existing subagent column", { timeout: 15000 },
 		for (const result of results) assert.deepEqual(result, { code: 0, stderr: "" });
 		assertColumn(f, 4);
 		assert.deepEqual(f.prematureLayoutReads, []);
+	} finally { await f.close(); }
+});
+
+test("equalizing sets absolute split ratios, so a repeat run changes nothing", { timeout: 15000 }, async () => {
+	const f = await fixture();
+	try {
+		for (let i = 0; i < 3; i++) assert.deepEqual(await f.spawn(), { code: 0, stderr: "" });
+		f.skewColumn();
+		const before = f.splitRatioSetCount();
+		assert.deepEqual(await f.equalize(() => {}), { code: 0, stderr: "" });
+		assertColumn(f, 3);
+		assert.equal(f.splitRatioSetCount() - before, 2, "one request per skewed divider");
+		assert.deepEqual(await f.equalize(() => {}), { code: 0, stderr: "" });
+		assert.equal(f.splitRatioSetCount() - before, 2, "an equal column needs no requests");
 	} finally { await f.close(); }
 });
 
