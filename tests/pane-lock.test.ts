@@ -11,7 +11,7 @@ const lockModule = new URL("../pane-lock.ts", import.meta.url).href;
 
 function fixture() {
 	const root = mkdtempSync(join(tmpdir(), "subagent-lock-"));
-	return { directory: join(root, "pane"), close: () => rmSync(root, { recursive: true, force: true }) };
+	return { directory: join(root, "locks"), key: "pane", close: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test("same-process callers cannot overlap critical sections", async () => {
@@ -19,7 +19,7 @@ test("same-process callers cannot overlap critical sections", async () => {
 	try {
 		let active = 0;
 		let completed = 0;
-		await Promise.all(Array.from({ length: 8 }, () => withPaneLayoutLock(f.directory, async () => {
+		await Promise.all(Array.from({ length: 8 }, () => withPaneLayoutLock(f.directory, f.key, async () => {
 			assert.equal(active++, 0);
 			await new Promise((resolve) => setTimeout(resolve, 10));
 			assert.equal(--active, 0);
@@ -33,8 +33,8 @@ test("same-process callers cannot overlap critical sections", async () => {
 test("operation failures release the lock", async () => {
 	const f = fixture();
 	try {
-		await assert.rejects(withPaneLayoutLock(f.directory, async () => { throw new Error("failed operation"); }), /failed operation/);
-		assert.equal(await withPaneLayoutLock(f.directory, async () => "next"), "next");
+		await assert.rejects(withPaneLayoutLock(f.directory, f.key, async () => { throw new Error("failed operation"); }), /failed operation/);
+		assert.equal(await withPaneLayoutLock(f.directory, f.key, async () => "next"), "next");
 		assert.deepEqual(readdirSync(f.directory), []);
 	} finally { f.close(); }
 });
@@ -45,10 +45,10 @@ test("waiting is bounded and a timed-out contender cleans up its claim", async (
 	const gate = new Promise<void>((resolve) => { release = resolve; });
 	let entered!: () => void;
 	const ready = new Promise<void>((resolve) => { entered = resolve; });
-	const holder = withPaneLayoutLock(f.directory, async () => { entered(); await gate; });
+	const holder = withPaneLayoutLock(f.directory, f.key, async () => { entered(); await gate; });
 	try {
 		await ready;
-		await assert.rejects(withPaneLayoutLock(f.directory, async () => assert.fail("must not acquire"), 75), /Timed out waiting/);
+		await assert.rejects(withPaneLayoutLock(f.directory, f.key, async () => assert.fail("must not acquire"), 75), /Timed out waiting/);
 		assert.equal(readdirSync(f.directory).length, 1);
 	} finally {
 		release();
@@ -57,13 +57,13 @@ test("waiting is bounded and a timed-out contender cleans up its claim", async (
 	}
 });
 
-test("different parent-pane lock directories do not block each other", async () => {
+test("different parent-pane keys sharing the lock directory do not block each other", async () => {
 	const f = fixture();
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => { release = resolve; });
-	const holder = withPaneLayoutLock(f.directory, () => gate);
+	const holder = withPaneLayoutLock(f.directory, f.key, () => gate);
 	try {
-		assert.equal(await withPaneLayoutLock(`${f.directory}-other`, async () => "independent", 75), "independent");
+		assert.equal(await withPaneLayoutLock(f.directory, "other", async () => "independent", 75), "independent");
 	} finally {
 		release();
 		await holder;
@@ -75,12 +75,12 @@ test("independent processes cannot overlap critical sections under repeated cont
 	const f = fixture();
 	const children: ReturnType<typeof spawn>[] = [];
 	try {
-		const marker = join(f.directory, "critical-section");
+		const marker = join(f.directory, "..", "critical-section");
 		const script = `
 			import { openSync, closeSync, rmSync } from "node:fs";
 			import { withPaneLayoutLock } from ${JSON.stringify(lockModule)};
 			for (let i = 0; i < 6; i++) {
-				await withPaneLayoutLock(${JSON.stringify(f.directory)}, async () => {
+				await withPaneLayoutLock(${JSON.stringify(f.directory)}, "pane", async () => {
 					const fd = openSync(${JSON.stringify(marker)}, "wx");
 					try { await new Promise(resolve => setTimeout(resolve, 5)); }
 					finally { closeSync(fd); rmSync(${JSON.stringify(marker)}); }
@@ -108,7 +108,7 @@ test("multiple contenders recover a crashed owner without overlapping", { timeou
 	const f = fixture();
 	const script = `
 		import { withPaneLayoutLock } from ${JSON.stringify(lockModule)};
-		await withPaneLayoutLock(${JSON.stringify(f.directory)}, async () => {
+		await withPaneLayoutLock(${JSON.stringify(f.directory)}, "pane", async () => {
 			process.stdout.write("acquired\\n");
 			await new Promise(() => { setInterval(() => {}, 1000); });
 		});
@@ -128,7 +128,7 @@ test("multiple contenders recover a crashed owner without overlapping", { timeou
 		await exited;
 		assert.equal(readdirSync(f.directory).length, 1, "crashed owner leaves its claim behind");
 		let active = 0;
-		await Promise.all(Array.from({ length: 4 }, () => withPaneLayoutLock(f.directory, async () => {
+		await Promise.all(Array.from({ length: 4 }, () => withPaneLayoutLock(f.directory, f.key, async () => {
 			assert.equal(active++, 0);
 			await new Promise((resolve) => setTimeout(resolve, 10));
 			assert.equal(--active, 0);
@@ -137,6 +137,31 @@ test("multiple contenders recover a crashed owner without overlapping", { timeou
 	} finally {
 		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 		await exited;
+		f.close();
+	}
+});
+
+test("released locks leave nothing behind per parent pane", async () => {
+	const f = fixture();
+	try {
+		for (const key of ["a", "b", "c"]) await withPaneLayoutLock(f.directory, key, async () => {});
+		assert.deepEqual(readdirSync(f.directory), []);
+	} finally { f.close(); }
+});
+
+test("a claim for one key is not read as a claim for a key it prefixes", async () => {
+	const f = fixture();
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	let entered!: () => void;
+	const ready = new Promise<void>((resolve) => { entered = resolve; });
+	const holder = withPaneLayoutLock(f.directory, "pane-1", async () => { entered(); await gate; });
+	try {
+		await ready;
+		assert.equal(await withPaneLayoutLock(f.directory, "pane", async () => "independent", 75), "independent");
+	} finally {
+		release();
+		await holder;
 		f.close();
 	}
 });

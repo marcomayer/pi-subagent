@@ -9,10 +9,10 @@ interface Claim {
 	ticket: number;
 }
 
-function readClaims(directory: string): Claim[] {
+function readClaims(directory: string, key: string): Claim[] {
 	const claims: Claim[] = [];
 	for (const name of readdirSync(directory)) {
-		if (!name.endsWith(".json")) continue;
+		if (!name.startsWith(`${key}.`) || !name.endsWith(".json")) continue;
 		const path = join(directory, name);
 		let claim: Claim;
 		try {
@@ -48,14 +48,19 @@ function readClaims(directory: string): Claim[] {
  * Assumes directory enumeration retains active claim names while rename replaces their contents; POSIX
  * rename alone does not guarantee that property. Intended for local filesystems, not a portable or distributed
  * filesystem lock. Dead-owner detection uses PID existence, so PID reuse can delay stale-claim recovery.
+ *
+ * Every lock shares one directory: claims are named `<key>.<pid>-<uuid>.json` and only same-key claims
+ * contend, so releasing a lock leaves nothing behind. `key` must not contain "." or "/".
  */
 export async function withPaneLayoutLock<T>(
 	directory: string,
+	key: string,
 	operation: () => Promise<T>,
 	timeoutMs = 60_000,
 ): Promise<T> {
+	if (!key || /[./]/.test(key)) throw new Error(`Invalid pane lock key: ${key}`);
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	const id = `${process.pid}-${randomUUID()}.json`;
+	const id = `${key}.${process.pid}-${randomUUID()}.json`;
 	const path = join(directory, id);
 	const temporary = `${path}.tmp`;
 	const deadline = performance.now() + timeoutMs;
@@ -66,10 +71,10 @@ export async function withPaneLayoutLock<T>(
 
 	try {
 		publish(0);
-		const ticket = readClaims(directory).reduce((max, claim) => Math.max(max, claim.ticket), 0) + 1;
+		const ticket = readClaims(directory, key).reduce((max, claim) => Math.max(max, claim.ticket), 0) + 1;
 		publish(ticket);
 		while (true) {
-			const blocked = readClaims(directory).some(
+			const blocked = readClaims(directory, key).some(
 				(claim) => claim.id !== id &&
 					(claim.ticket === 0 || claim.ticket < ticket || (claim.ticket === ticket && claim.id < id)),
 			);

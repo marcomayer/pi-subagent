@@ -217,7 +217,7 @@ function withRunPaneLock<T>(parentPaneId: string, operation: () => Promise<T>): 
 	const key = createHash("sha256")
 		.update(`${process.env.HERDR_SOCKET_PATH ?? ""}\0${parentPaneId}`)
 		.digest("hex");
-	return withPaneLayoutLock(join(getAgentDir(), "subagent-pane-locks", key), operation);
+	return withPaneLayoutLock(join(getAgentDir(), "subagent-pane-locks"), key, operation);
 }
 
 /** Pane ids of the other live runs spawned by the same parent session. */

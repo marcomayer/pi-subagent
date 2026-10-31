@@ -223,10 +223,10 @@ async function fixture(pidDelayMs: number | null = 0) {
 			const root = join(getAgentDir(), "subagent-pane-locks");
 			// Synchronize on actual contention, not on an assumed subprocess startup time.
 			while (!completed) {
-				const waiting = readdirSync(root).some(directory => {
-					const claims = readdirSync(join(root, directory)).filter(name => name.endsWith(".json"));
-					return claims.length > 1 && claims.some(name => name.startsWith(process.pid + "-"));
-				});
+				const claims = readdirSync(root).filter(name => name.endsWith(".json"));
+				const own = claims.find(name => name.split(".")[1]?.startsWith(process.pid + "-"));
+				const key = own?.split(".")[0];
+				const waiting = own !== undefined && claims.filter(name => name.startsWith(key + ".")).length > 1;
 				if (waiting) { process.send("waiting"); break; }
 				await setImmediate();
 			}

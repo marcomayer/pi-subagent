@@ -49,9 +49,8 @@ async function settle() {
 	// before advancing the fake clock. Assertions remain at the Herdr request boundary.
 	const root = join(process.env.PI_CODING_AGENT_DIR!, "subagent-pane-locks");
 	function hasOwnClaim() {
-		return readdirSync(root).some((directory) =>
-			readdirSync(join(root, directory)).some((name) => name.startsWith(`${process.pid}-`) && name.endsWith(".json")),
-		);
+		// Claims are named <key>.<pid>-<uuid>.json.
+		return readdirSync(root).some((name) => name.split(".")[1]?.startsWith(`${process.pid}-`) && name.endsWith(".json"));
 	}
 	await setImmediate();
 	while (hasOwnClaim()) await setImmediate();
