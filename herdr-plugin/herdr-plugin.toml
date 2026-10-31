@@ -9,6 +9,6 @@ platforms = ["linux", "macos"]
 # The run directory comes from the pane's --env; launch.sh is written by the subagent extension.
 [[panes]]
 id = "subagent"
-title = "Pi subagent"
+title = "subagent: Pi"
 placement = "split"
 command = ["sh", "-c", "exec sh \"$PI_SUBAGENT_RUN_DIR/launch.sh\""]

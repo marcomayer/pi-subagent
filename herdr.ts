@@ -129,7 +129,7 @@ export async function focusSubagentPane(paneId: string): Promise<void> {
 	await herdrRequest("plugin.pane.focus", { pane_id: paneId });
 }
 
-/** Set the label herdr shows for a pane. */
+/** Set the label herdr shows for a pane, keeping subagents visibly distinct. */
 export async function renameSubagentPane(paneId: string, label: string): Promise<void> {
-	await herdrRequest("pane.rename", { pane_id: paneId, label });
+	await herdrRequest("pane.rename", { pane_id: paneId, label: `subagent: ${label}` });
 }

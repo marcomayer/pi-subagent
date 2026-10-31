@@ -32,7 +32,7 @@ Spawn with a descriptive name using the parent session's provider, model, and th
 subagent spawn --name review --prompt "Review the current diff independently"
 ```
 
-Names appear in the parent UI. Generated handles remain the stable identifiers used by management commands.
+Names appear in the parent UI. Pane titles use `subagent: <name>` (or the handle for unnamed runs), including after renames. Generated handles remain the stable identifiers used by management commands.
 
 Override the model configuration when needed:
 

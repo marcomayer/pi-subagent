@@ -38,6 +38,7 @@ async function fixture(pidDelayMs: number | null = 0) {
 	let pendingLaunches = 0;
 	let onOpen: (() => void) | undefined;
 	const opens: { id: string; target: string; direction: string }[] = [];
+	const renames: { pane_id: string; label: string }[] = [];
 	const prematureLayoutReads: string[] = [];
 	const sockets = new Set<Socket>();
 	const timers = new Set<ReturnType<typeof setTimeout>>();
@@ -130,6 +131,9 @@ async function fixture(pidDelayMs: number | null = 0) {
 				}
 				reply({ plugin_pane: { pane: { pane_id: id } } });
 				onOpen?.();
+			} else if (request.method === "pane.rename") {
+				renames.push(request.params);
+				reply({});
 			} else if (request.method === "pane.resize") {
 				try {
 					resize(tree, request.params.pane_id, request.params.direction, request.params.amount);
@@ -200,6 +204,12 @@ async function fixture(pidDelayMs: number | null = 0) {
 
 	return {
 		opens,
+		renames,
+		labelPane: (label: string) => run(["--input-type=module", "-e", `
+			import { labelOwnPane } from ${JSON.stringify(sharedPath)};
+			process.env.HERDR_PANE_ID = "child-1";
+			await labelOwnPane(${JSON.stringify(label)});
+		`]),
 		prematureLayoutReads,
 		layout,
 		spawn: () => run([cliPath, "spawn", "--name", "test", "--prompt", "hello"]),
@@ -265,6 +275,20 @@ function assertColumn(f: Awaited<ReturnType<typeof fixture>>, count: number) {
 		assert.ok(Math.abs(pane.rect.height - 120 / count) < 0.001, JSON.stringify(panes));
 	}
 }
+
+test("subagent pane labels retain their prefix for names, handles, and renames", { timeout: 15000 }, async () => {
+	const f = await fixture();
+	try {
+		for (const label of ["review", "a1b2c3", "renamed review"]) {
+			assert.deepEqual(await f.labelPane(label), { code: 0, stderr: "" });
+		}
+		assert.deepEqual(f.renames, [
+			{ pane_id: "child-1", label: "subagent: review" },
+			{ pane_id: "child-1", label: "subagent: a1b2c3" },
+			{ pane_id: "child-1", label: "subagent: renamed review" },
+		]);
+	} finally { await f.close(); }
+});
 
 test("sequential spawns build an equal-height column beside the parent", { timeout: 15000 }, async () => {
 	const f = await fixture();
